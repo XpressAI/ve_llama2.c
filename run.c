@@ -20,6 +20,8 @@ $ ./run
     #include <unistd.h>
     #include <sys/mman.h>
 #endif
+#include <cblas.h>
+
 // ----------------------------------------------------------------------------
 // Transformer and RunState structs, and related memory management
 
@@ -199,11 +201,11 @@ void softmax(float* x, int size) {
     }
 }
 
-void matmul(float* xout, float* x, float* w, int n, int d) {
+/*void matmul(int n, int d, float xout[d], float x[n], float w[d * n]) {
     // W (d,n) @ x (n,) -> xout (d,)
     // by far the most amount of time is spent inside this little function
     int i;
-    #pragma omp parallel for private(i)
+    #pragma omp parallel for private(i) shared(xout)
     for (i = 0; i < d; i++) {
         float val = 0.0f;
         for (int j = 0; j < n; j++) {
@@ -211,6 +213,27 @@ void matmul(float* xout, float* x, float* w, int n, int d) {
         }
         xout[i] = val;
     }
+}*/
+
+
+float max(float* input, size_t size){
+    float max = 0;
+    for(size_t i = 0; i < size; i++){
+        if(input[i] > max) max = input[i];
+    }
+    return max;
+}
+
+
+/*void matmul(int n, int d, float xout[1 * d], float x[1 * n], float w[n * d]) {
+    // Error ** On entry to SGEMM  parameter number 10 had an illegal value
+    cblas_sgemm(CblasColMajor, CblasNoTrans, CblasNoTrans, d, 1, n, 1.0f, w, d, x, n, 0, xout, d);
+}*/
+
+
+void matmul(int n, int d, float xout[d], float x[n], float w[d * n]) {
+    // W (d,n) @ x (n,) -> xout (d,)
+    cblas_sgemv(CblasRowMajor, CblasNoTrans, d, n, 1.0, w, n, x, 1, 0.0, xout, 1);
 }
 
 void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights* w) {
@@ -236,9 +259,9 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         rmsnorm(s->xb, x, w->rms_att_weight + l*dim, dim);
 
         // qkv matmuls for this position
-        matmul(s->q, s->xb, w->wq + l*dim*dim, dim, dim);
-        matmul(s->k, s->xb, w->wk + l*dim*dim, dim, dim);
-        matmul(s->v, s->xb, w->wv + l*dim*dim, dim, dim);
+        matmul(dim, dim, s->q, s->xb, w->wq + l*dim*dim);
+        matmul(dim, dim, s->k, s->xb, w->wk + l*dim*dim);
+        matmul(dim, dim, s->v, s->xb, w->wv + l*dim*dim);
 
         // RoPE relative positional encoding: complex-valued rotate q and k by freq_cis in each head
         for (int i = 0; i < dim; i+=2) {
@@ -302,7 +325,7 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         }
 
         // final matmul to get the output of the attention
-        matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
+        matmul(dim, dim, s->xb2, s->xb, w->wo + l*dim*dim);
 
         // residual connection back into x
         accum(x, s->xb2, dim);
@@ -312,8 +335,8 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
 
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
         // first calculate self.w1(x) and self.w3(x)
-        matmul(s->hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
-        matmul(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
+        matmul(dim, hidden_dim, s->hb, s->xb, w->w1 + l*dim*hidden_dim);
+        matmul(dim, hidden_dim, s->hb2, s->xb, w->w3 + l*dim*hidden_dim);
 
         // F.silu; silu(x)=x*σ(x),where σ(x) is the logistic sigmoid
         for (int i = 0; i < hidden_dim; i++) {
@@ -326,7 +349,7 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         }
 
         // final matmul to get the output of the ffn
-        matmul(s->xb, s->hb, w->w2 + l*dim*hidden_dim, hidden_dim, dim);
+        matmul(hidden_dim, dim, s->xb, s->hb, w->w2 + l*dim*hidden_dim);
 
         // residual connection
         accum(x, s->xb, dim);
@@ -336,7 +359,7 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
     rmsnorm(x, x, w->rms_final_weight, dim);
 
     // classifier into logits
-    matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
+    matmul(p->dim, p->vocab_size, s->logits, x, w->wcls);
 }
 
 // ----------------------------------------------------------------------------
@@ -460,7 +483,7 @@ int compare(const void* a, const void* b) {
     return 0;
 }
 
-int sample_topp(float* probabilities, int n, float topp, ProbIndex* probindex) {
+int old_sample_topp(float* probabilities, int n, float topp, ProbIndex* probindex) {
     // top-p sampling (or "nucleus sampling") samples from the smallest set of
     // tokens that exceed probability topp. This way we never sample tokens that
     // have very low probabilities and are less likely to go "off the rails".
@@ -495,6 +518,97 @@ int sample_topp(float* probabilities, int n, float topp, ProbIndex* probindex) {
     return probindex[last_idx].index; // in case of rounding errors
 }
 
+int sample_topp(float* probabilities, int n, float topp, ProbIndex* probindex) {
+    // top-p sampling (or "nucleus sampling") samples from the smallest set of
+    // tokens that exceed probability topp. This way we never sample tokens that
+    // have very low probabilities and are less likely to go "off the rails".
+    //printf("wee n:%d\n", n);
+    //fflush(stdout);
+
+    // Get the top 256 probabilities.
+    float window[256];
+    int idxs[256];
+
+    for (int i = 0; i < 256; i++) {
+        window[i] = probabilities[i];
+        idxs[i] = i;
+    }
+    //printf("2!!!\n");
+    //fflush(stdout);
+
+    int chunks = n / 256;
+    for (int chunk = 1; chunk < chunks; chunk++) {
+        for (int i = 0; i < 256; i++) {
+            if (window[i] < probabilities[256 * chunk + i]) {
+                window[i] = probabilities[256 * chunk + i];
+                idxs[i] = 256 * chunk + i;
+            }
+        }
+    }
+
+    //printf("3!!!\n");
+   //fflush(stdout);
+
+
+    float window2[256];
+    for (int i = 0; i < 256; i++) {
+        window2[i] = window[i];
+    }
+
+    //printf("3!!!\n");
+    //fflush(stdout);
+
+    int ordered[256];
+    for (int i = 0; i < 256; i++) {
+        int max_idx = 0;
+    
+        for (int j = 0; j < 256; j++) {
+            if (window2[j] > window[max_idx]) {
+                max_idx = j;
+            }
+        }
+
+        ordered[i] = max_idx;
+        window2[max_idx] = 0.0f;
+    }
+
+    //printf("4!!!\n");
+    //fflush(stdout);
+
+    // truncate the list where cumulative probability exceeds topp
+    
+    float cumulative_prob = 0.0f;
+    int last_idx = 0;
+    for (int i = 0; i < 256; i++) {
+        cumulative_prob += window[ordered[i]];
+        if (cumulative_prob > topp) {
+            last_idx = i;
+            break; // we've exceeded topp by including last_idx
+        }
+    }
+
+    //printf("5!!!\n");
+    //fflush(stdout);
+
+    // sample from the truncated list
+    float r = random_f32() * cumulative_prob;
+    float cdf = 0.0f;
+    for (int i = 0; i <= last_idx; i++) {
+        cdf += window[ordered[i]];
+        if (r < cdf) {
+            //printf(" 1returning: %d i: %d\n", idxs[ordered[i]], i);
+            //fflush(stdout);
+            return idxs[ordered[i]];
+        }
+    }
+    
+    //printf("6!!!\n");
+    //fflush(stdout);
+
+    //printf(" 2returning: %d\n", idxs[ordered[last_idx]]);
+    //fflush(stdout);
+    return idxs[ordered[last_idx]]; // in case of rounding errors
+}
 
 // ----------------------------------------------------------------------------
 // int main
